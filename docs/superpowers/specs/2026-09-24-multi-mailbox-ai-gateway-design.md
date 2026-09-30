@@ -2,13 +2,17 @@
 
 Date: 2026-09-24
 Status: approved in brainstorming, pending written review
+Revised: 2026-09-29, merged the selected items from
+`2026-09-26-spark-cli-gap-analysis.md`
 
 ## 1. Purpose
 
 A self-hosted service that syncs ten personal mailboxes over IMAP into one
 encrypted SQLite database and exposes them to AI agents and scripts through a
 REST API and an MCP server. Single user. A few calls per day. Agents can read,
-search, and create drafts. Nothing is ever sent, deleted, moved, or flagged.
+search, and create or edit drafts. Nothing is ever sent, moved, or flagged,
+and nothing is deleted except the previous copy of a gateway-created draft
+when that draft is edited (7.4).
 
 ## 2. Decisions made during brainstorming
 
@@ -17,28 +21,33 @@ search, and create drafts. Nothing is ever sent, deleted, moved, or flagged.
 | Providers | Gmail / Google Workspace, Outlook.com (OAuth2), Yahoo, Fastmail, iCloud, 126 (NetEase), QQ, other plain IMAP |
 | ProtonMail | Out of scope entirely. No Bridge container. |
 | Outlook auth | OAuth2 device-code flow built into the worker CLI; tokens stored in the DB |
-| Runtime | Node 24, TypeScript |
+| Runtime | Node 24, TypeScript |`
 | Deployment | Docker Compose on a VPS, behind the user's existing Caddy on a dedicated subdomain |
 | Architecture | Two containers from one image: `api` and `worker`, sharing one SQLite volume |
 | Database | SQLite via `better-sqlite3-multiple-ciphers`, page-encrypted with a key from env, WAL mode, FTS5 |
-| Folders synced | INBOX, Sent, Archive for every account. Gmail: All Mail only, with labels. Full history, no time cutoff. |
+| Folders synced | INBOX, Sent, Archive for every account, plus any folder listed in the account's opt-in `extra_folders` (Trash, Spam, Drafts, custom folders). Gmail: All Mail only, with labels. Full history, no time cutoff. |
+| Aliases | `aliases` per account, exact addresses or `*@domain` catch-all patterns. A reply draft is sent From the address the original was received at. |
 | Sync trigger | Timer every 10 minutes plus an explicit `sync` operation that can target all, one, or several accounts |
 | Recent bound | Total limit (default 50) with an optional multi-account filter |
 | Read operations | unread, recent, search, get_message, get_thread, plus status |
+| Filters and paging | Search filters on from, to, cc, subject, has_attachment, flagged, dates, unread, and Gmail labels. `offset` pagination on list operations. Optional full bodies on search. |
 | Message ids | Opaque `msg_<rowid>` |
-| Drafts | Plain text only, reply threading via stored headers, no HTML, no attachments |
+| Drafts | Plain text only, reply and reply-all threading via stored headers, From chosen among the account address and its aliases, gateway-created drafts can be edited, no HTML, no attachments |
+| HTML bodies | Converted to text with links preserved as `[text](url)` |
 | Attachments | Metadata only (name, type, size). Never downloaded. |
 | Chinese search | Per-character CJK tokenization with phrase queries. No trigram index. |
 | Auth | Authentik is the only token issuer. OAuth 2.1 for claude.ai / ChatGPT; long-lived Authentik JWTs for apps without OAuth. No static tokens. |
 | Revocation | Authentik token introspection, cached 5 minutes, fail closed |
 | Audit log | Every service call recorded in the DB and to stdout, queryable over REST and CLI |
 | Clients | Claude Code, claude.ai / Claude Desktop connector, chatgpt.com connector, Codex, OpenClaw, Hermes, scripts over REST, at least one app that only supports REST with a bearer token |
+| Agent skill file | `SKILL.md` alongside the README, for Codex, scripts, and other REST-only clients |
 
 ## 3. Out of scope
 
-Sending mail, deleting, moving, marking spam, changing flags from the API,
-attachment download, HTML drafts, calendar, contacts, multi-user, ProtonMail,
-a web UI.
+Sending mail, deleting (other than replacing a gateway-created draft on
+edit), moving, marking spam, changing flags from the API, attachment download,
+HTML drafts, draft attachments, forwarding, signatures, calendar, contacts,
+multi-user, ProtonMail, a web UI.
 
 ## 4. Components
 
@@ -52,9 +61,10 @@ One Docker image, two containers, one named volume.
   `/.well-known/oauth-protected-resource`, and `GET /healthz`.
 - Opens the DB read-mostly. Writes exactly two tables: `sync_requests` and
   `audit_log`.
-- Drafts are the one operation where the API itself opens a short-lived IMAP
-  connection to APPEND. Routing this through the worker would add a second IPC
-  path for one operation.
+- Creating and editing drafts are the only operations where the API itself
+  opens a short-lived IMAP connection, to APPEND and, on edit, to fetch and
+  remove the previous copy. Routing this through the worker would add a second
+  IPC path for two operations.
 
 ### 4.2 `worker` container
 
@@ -91,6 +101,7 @@ accounts
   id INTEGER PK
   name TEXT UNIQUE            -- from accounts.yaml, the public account name
   email TEXT
+  aliases_json TEXT           -- JSON array from accounts.yaml: addresses or *@domain patterns
   provider TEXT               -- gmail | outlook | yahoo | fastmail | icloud | 126 | qq | generic
   enabled INTEGER
   drafts_path TEXT            -- cached special-use \Drafts path
@@ -102,7 +113,7 @@ folders
   id INTEGER PK
   account_id INTEGER FK
   path TEXT                   -- IMAP mailbox path
-  role TEXT                   -- inbox | sent | archive | all
+  role TEXT                   -- inbox | sent | archive | all | custom
   uidvalidity INTEGER
   highest_uid INTEGER         -- incremental cursor; fetch UID > highest_uid
   backfill_low_uid INTEGER    -- backfill cursor; next chunk is [low-200, low-1]
@@ -125,6 +136,7 @@ messages
   reply_to_addr TEXT
   to_json TEXT                -- JSON array of {name, address}
   cc_json TEXT
+  delivered_to_json TEXT      -- JSON array of addresses from Delivered-To / X-Delivered-To / X-Original-To
   subject TEXT
   date TEXT                   -- ISO 8601 UTC from Date header, fallback INTERNALDATE
   unread INTEGER              -- 1 when \Seen absent
@@ -192,6 +204,28 @@ and stores `X-GM-LABELS` per message. Role membership is derived:
 For all other providers, INBOX, Sent, and Archive are distinct `folders` rows.
 Accounts whose provider has no Archive folder simply have no archive row.
 
+Every Gmail label, including user labels, is reachable through the `labels`
+filter (7.2) because All Mail carries them all. Gmail's Trash and Spam are not
+part of All Mail; they are synced only when listed in `extra_folders` (5.4).
+
+### 5.4 Extra folders
+
+Each account may list additional IMAP folder paths under `extra_folders` in
+`accounts.yaml`: Trash, Spam, Drafts, or any custom folder (for example the
+Chinese-named folders on 126). Each is synced as a `folders` row with
+`role = custom`, through the same incremental, backfill, and reconciliation
+paths as the role folders.
+
+- On Gmail only the `\Trash` and `\Junk` special-use folders are accepted.
+  Any other path is a label folder that would duplicate All Mail; it is
+  skipped with a warning.
+- A path that does not exist on the server is skipped with a warning and
+  reported in `accounts.last_error`.
+- A path removed from `extra_folders` has its `folders` row and messages
+  deleted on the next pass.
+- Custom folders are never included by default. Reads return them only when
+  the `folders` filter names the path explicitly (7.1).
+
 ### 5.2 Chinese and CJK search
 
 FTS5's `unicode61` tokenizer treats a run of CJK ideographs as one token, so a
@@ -215,6 +249,9 @@ QQ is done by mailparser.
 
 - HTML is converted to plain text with `html-to-text` at sync time when no
   `text/plain` part exists.
+- Links survive the conversion. `html-to-text` is configured so an anchor
+  renders as `[text](url)`, or as the bare URL when the text equals the href.
+  `mailto:` links keep the address. Image sources are dropped.
 - `text_body` is capped at 512 KB. Raw HTML and raw MIME are not stored.
 - Rough sizing: 10 KB per message average, 200k messages ≈ 2 GB plus FTS.
 
@@ -234,14 +271,16 @@ QQ is done by mailparser.
 
 Each pass lists folders and maps special-use attributes to roles: `INBOX`
 → inbox, `\Sent` → sent, `\Archive` → archive, `\Drafts` → cached in
-`accounts.drafts_path`. Gmail maps only `\All` → all. Unknown or missing
-folders are skipped. New folder rows get `highest_uid = UIDNEXT - 1` and
+`accounts.drafts_path`. Gmail maps only `\All` → all. Paths listed in the
+account's `extra_folders` map to custom (5.4). Unknown or missing folders are
+skipped. New folder rows get `highest_uid = UIDNEXT - 1` and
 `backfill_low_uid = UIDNEXT`, so new mail is caught immediately while backfill
 walks backwards.
 
 ### 6.3 Fetch pipeline
 
-For each UID: fetch flags, envelope, INTERNALDATE, size, body structure, and
+For each UID: fetch flags, envelope, INTERNALDATE, size, body structure, the
+`Delivered-To`, `X-Delivered-To`, and `X-Original-To` header fields, and
 (Gmail) labels. From the body structure, download only `text/plain` and
 `text/html` leaf parts. Attachments are never downloaded; their filename,
 content type, and size come from the body structure. Parse with mailparser,
@@ -317,21 +356,31 @@ ahead of any backfill work, writes per-account `{new, updated, error}` into
 
 ## 7. API surface
 
-One service module with nine functions. REST routes and MCP tools are thin
+One service module with ten functions. REST routes and MCP tools are thin
 wrappers. Each function has one zod input schema used for REST validation and
 as the MCP tool input schema.
 
 ### 7.1 Conventions
 
 - `accounts`: optional array of account names; omitted means all enabled.
-- `folders`: optional array from `inbox | sent | archive`.
+- `folders`: optional array whose entries are a role (`inbox | sent |
+  archive`) or the exact IMAP path of a custom folder from `extra_folders`.
+  "All" as a default means the three roles; custom folders are returned only
+  when named.
+- `labels`: optional array of Gmail label names as stored in `X-GM-LABELS`
+  (`\Starred`, `\Important`, or a user label name). A message must carry
+  every listed label. Giving `labels` restricts the call to Gmail accounts.
+- `offset`: optional, default 0. Rows to skip, for walking past the first
+  page. A page shorter than `limit` is the last one.
 - Every read response includes `synced_at`: the oldest `last_success_at`
   among covered accounts.
 - Summary shape: `id, account, folder, from {name, email}, subject, date,
-  unread, has_attachments, snippet`.
+  unread, has_attachments, snippet`. `folder` is the role, or the path for a
+  custom folder.
 - Errors: `{error: {code, message}}`. 400 validation, 401 auth, 404 unknown
-  id or account, 409 draft to a disabled or errored account, 502 IMAP append
-  failure, 503 from `/healthz` and from auth when Authentik is unreachable.
+  id, account, or draft uid, 409 draft to a disabled or errored account or an
+  edit of a draft the gateway did not create, 502 IMAP append failure, 503
+  from `/healthz` and from auth when Authentik is unreachable.
 - Reads never fail because the worker is down; they return an older
   `synced_at`.
 
@@ -339,12 +388,13 @@ as the MCP tool input schema.
 
 | Function | REST | Input | Output |
 |---|---|---|---|
-| `get_unread` | `GET /v1/unread` | accounts, limit (50, max 200) | summaries, INBOX only, newest first |
-| `get_recent` | `GET /v1/recent` | accounts, folders (default inbox), limit (50, max 200) | summaries newest first |
-| `search` | `GET /v1/search` | query, accounts, folders (default all), from, after, before, unread_only, limit (25, max 100) | summaries ranked by bm25 |
-| `get_message` | `GET /v1/messages/:id` | id | full headers, text_body, attachments metadata, thread_root |
+| `get_unread` | `GET /v1/unread` | accounts, limit (50, max 200), offset | summaries, INBOX only, newest first |
+| `get_recent` | `GET /v1/recent` | accounts, folders (default inbox), labels, limit (50, max 200), offset, order (`desc` default, or `asc`) | summaries by date in the given order |
+| `search` | `GET /v1/search` | query, accounts, folders (default all), labels, from, to, cc, subject, after, before, unread_only, has_attachment, flagged, include_body, limit (25, max 100), offset | summaries ranked by bm25; newest first when `query` is omitted |
+| `get_message` | `GET /v1/messages/:id` | id | full headers including labels and delivered-to, text_body, attachments metadata, thread_root |
 | `get_thread` | `GET /v1/messages/:id/thread` | id | up to 30 messages, oldest first, bodies capped at 8 KB with `truncated` |
-| `create_draft` | `POST /v1/drafts` | account, to[], cc[], bcc[], subject, text, reply_to_message_id | account, folder, uid |
+| `create_draft` | `POST /v1/drafts` | account, from, to[], cc[], bcc[], subject, text, reply_to_message_id, reply_all | account, folder, uid, from |
+| `update_draft` | `PATCH /v1/drafts/:account/:uid` | account, uid, from, to[], cc[], bcc[], subject, text (all but account and uid optional) | account, folder, uid (new), from |
 | `sync` | `POST /v1/sync` | accounts, wait (true, ≤ 60 s) | per-account counts, or queued status |
 | `get_status` | `GET /v1/status` | none | see 7.3 |
 | `get_audit` | `GET /v1/audit` (REST only) | client, operation, since, limit | audit rows |
@@ -355,6 +405,24 @@ double-quoted before entering the FTS MATCH expression so user input cannot
 cause an FTS syntax error, CJK runs are expanded per 5.2, and terms are ANDed.
 `from` filters on `from_addr` or `from_name` with LIKE. `after` / `before` are
 ISO dates.
+
+Additional search filters, all optional and ANDed with the rest:
+
+- `to`: LIKE on names and addresses in `to_json`, and on
+  `delivered_to_json` so mail received at an alias through Bcc or a catch-all
+  is found.
+- `cc`: LIKE on names and addresses in `cc_json`.
+- `subject`: LIKE on `subject`. Substring match, so it works for CJK without
+  going through FTS.
+- `has_attachment`, `flagged`: booleans on the existing columns.
+- `labels`: per 7.1, matched with `json_each` over `labels_json`.
+
+`query` is optional when at least one other filter is given; the results are
+then ordered newest first instead of by bm25. A call with neither a query nor
+a filter is a 400.
+
+`include_body: true` adds `text_body` to each search result, capped at 8 KB
+with `truncated`, the same as `get_thread`.
 
 Thread walking: starting from the message, collect the set of Message-IDs from
 its `message_id`, `in_reply_to`, and `references_json`; repeatedly select
@@ -370,14 +438,19 @@ messages. Cross-folder within one account.
   db: { size_bytes, message_count },
   sync_requests: [ { id, status, accounts, created_at } ],   // queued or running
   accounts: [ {
-    name, email, provider, enabled,
+    name, email, aliases, provider, enabled,
     status,                                  // ok | backfilling | error | never_synced
     last_success_at, last_error, last_error_at,
     message_count, unread_count,
-    folders: [ { path, role, indexed, backfill_done, estimated_remaining } ]
+    folders: [ { path, role, indexed, backfill_done, estimated_remaining } ],
+    labels: [ { name, count } ]              // Gmail only
   } ]
 }
 ```
+
+`folders` includes custom folders, so this is where an agent learns the paths
+it can pass to the `folders` filter, the label names it can pass to `labels`,
+and the aliases it can pass as `from` on a draft.
 
 `/healthz` returns 503 if the worker heartbeat is older than 15 minutes or the
 database cannot be opened.
@@ -390,24 +463,92 @@ database cannot be opened.
    its Message-ID, set `References` to its references plus its Message-ID,
    prefix subject with `Re: ` if not already present, and default `to` to the
    original's Reply-To or From when `to` is omitted.
-3. Build MIME with nodemailer's MailComposer: From = account email, text body,
-   a fresh Message-ID.
-4. Open an IMAP connection, APPEND to `drafts_path` with `\Draft`, logout.
-5. Return `{account, folder, uid}`. Nothing is written to `messages`. The
-   Drafts folder is never synced.
+3. With `reply_all: true` (valid only with `reply_to_message_id`): To
+   defaults to the original's Reply-To or From plus the original To
+   recipients, and Cc defaults to the original Cc. The account's own address
+   and anything matching its aliases are removed, as are duplicates. An
+   explicit `to` or `cc` replaces the corresponding default.
+4. Resolve From (see "From address" below).
+5. Build MIME with nodemailer's MailComposer: the resolved From, text body,
+   a fresh Message-ID, and the marker header `X-Mail-Gateway-Draft: 1`.
+6. Open an IMAP connection, APPEND to `drafts_path` with `\Draft`, logout.
+7. Return `{account, folder, uid, from}`. Nothing is written to `messages`.
+   The Drafts folder is not synced unless the account lists it in
+   `extra_folders`.
+
+#### From address
+
+An account owns its `email` plus every entry in `aliases`. An alias is an
+exact address or a `*@domain` pattern, which covers a personal domain hosted
+on the account (the Fastmail case, where mail arrives at many different
+addresses under one domain). Matching is case-insensitive.
+
+From is resolved in this order:
+
+1. An explicit `from`. It must equal the account email or match an alias,
+   otherwise 400.
+2. On a reply, the address the original was received at: the first address
+   that the account owns among the original's To, then Cc, then
+   `delivered_to_json`. If the original was sent by the account itself (its
+   From is an owned address), that From is reused.
+3. The account email.
+
+The reply therefore always goes out from the same address the correspondent
+wrote to, including when that address only appears in a delivery header
+(Bcc, catch-all, mailing list).
+
+#### Editing a draft
+
+`update_draft` replaces a draft the gateway created earlier. IMAP has no
+in-place replace, so the new version is appended before the old one is
+removed; a failure in between leaves both copies rather than none.
+
+1. Resolve the account as in step 1 above. Open an IMAP connection, select
+   `drafts_path`, fetch the message with the given uid using PEEK. Missing
+   uid: 404.
+2. Require the `\Draft` flag and the `X-Mail-Gateway-Draft` header. Anything
+   else is a draft the user or another client wrote: 409, untouched.
+3. Parse it. Each supplied field replaces the stored value; omitted fields
+   are kept. `In-Reply-To`, `References`, and the Message-ID are carried over.
+   A supplied `from` is validated as above.
+4. APPEND the rebuilt message with `\Draft`.
+5. Remove the old copy with `UID STORE +FLAGS \Deleted` and `UID EXPUNGE` on
+   that single uid. A server without UIDPLUS cannot expunge one message
+   safely, so the operation is refused up front with 409 `not_supported` and
+   nothing is changed.
+6. Return `{account, folder, uid, from}` with the new uid. The old uid is no
+   longer valid.
+
+This is the only place the gateway deletes anything, and it can only ever
+remove a message that carries the gateway's own marker header.
 
 ### 7.5 MCP
 
 - `@modelcontextprotocol/sdk`, Streamable HTTP transport, stateless, JSON
   responses, mounted at `/mcp`.
 - Tools: `get_unread`, `get_recent`, `search`, `get_message`, `get_thread`,
-  `create_draft`, `sync`, `get_status`. Not `get_audit`.
+  `create_draft`, `update_draft`, `sync`, `get_status`. Not `get_audit`.
 - Tool descriptions are written for the model. `sync` says data refreshes
   automatically every 10 minutes and the tool should only be called when the
   user explicitly needs mail newer than `synced_at`. `create_draft` says
-  nothing is ever sent and the draft appears in the account's Drafts folder for
-  the user to review. `get_status` is described as the way to learn account
-  names and addresses.
+  nothing is ever sent, the draft appears in the account's Drafts folder for
+  the user to review, and on a reply From is chosen automatically to match
+  the address the original was received at, so `from` should be left out
+  unless the user asks for a specific address. `update_draft` says it only
+  works on drafts created through this gateway and returns a new uid.
+  `get_status` is described as the way to learn account names, addresses,
+  aliases, custom folder paths, and Gmail label names.
+
+### 7.6 Agent skill file
+
+`SKILL.md` sits alongside the README for clients that talk REST and never see
+the MCP tool descriptions (Codex, scripts, the bearer-token-only app). It
+covers the base URL and bearer auth, every `/v1` route with its inputs, the
+conventions in 7.1, the same usage guidance as the MCP tool descriptions
+(when to call `sync`, that drafts are never sent, how From is chosen), and one
+curl example per operation. It is written by hand and kept in step with the
+zod schemas; a unit test fails if an operation or input name in the schemas
+is missing from the file.
 
 ## 8. Auth
 
@@ -465,15 +606,16 @@ application. The gateway trusts any active token from an allowed client id.
 
 ## 9. Audit log
 
-A single wrapper around all nine service functions writes one `audit_log` row
+A single wrapper around all ten service functions writes one `audit_log` row
 per call, whichever transport it came from, and emits the same record as a
 pino structured log line.
 
 - Recorded: timestamp, request id, client ip (from `X-Forwarded-For` set by
   Caddy), subject, client id, client name, transport, operation, redacted
   params, result summary, error code, duration.
-- Redaction: params keep query, accounts, folders, limit, ids, from/after/
-  before, and for drafts the account, recipients, subject, and body length.
+- Redaction: params keep query, accounts, folders, labels, limit, offset,
+  order, ids, from/to/cc/subject/after/before and the boolean filters, and
+  for drafts the account, uid, from, recipients, subject, and body length.
   The draft text is never stored.
 - Result summary: row count and returned message ids for reads; account,
   folder, uid for drafts; request id for sync; error code on failure.
@@ -502,6 +644,16 @@ accounts:
     email: 12345@qq.com
     password_env: QQ_PASSWORD
     enabled: true
+  - name: fastmail
+    provider: fastmail
+    email: me@fastmail.com
+    password_env: FASTMAIL_PASSWORD
+    aliases:                # optional; addresses this account also receives at
+      - alan@example.com
+      - "*@example.com"     # catch-all for a domain hosted on this account
+    extra_folders:          # optional; IMAP paths synced with role = custom
+      - Trash
+      - Spam
   - name: custom
     provider: generic
     email: me@example.org
@@ -556,7 +708,7 @@ src/
   imap/          provider profiles, connection factory, outlook oauth
   sync/          folder discovery, fetch pipeline, incremental, backfill,
                  reconciliation, sync request handling, scheduler
-  service/       the nine functions + audit wrapper
+  service/       the ten functions + audit wrapper
   http/          Hono app, auth middleware, well-known, REST routes
   mcp/           tool registration over the service module
   cli/           auth, status, resync, audit
@@ -572,6 +724,7 @@ docker-compose.yml
 accounts.example.yaml
 .env.example
 README.md
+SKILL.md         agent instructions for REST-only clients (7.6)
 ```
 
 ## 13. Testing
@@ -584,17 +737,31 @@ vitest throughout.
   unread, recent with folder and multi-account filters, search ranking, search
   input that would break FTS syntax, Chinese substring search (1, 2, and 4
   character queries), thread walking across folders, id mapping and 404s,
-  `synced_at` computation.
+  `synced_at` computation. Each search filter alone and combined (to, cc,
+  subject, has_attachment, flagged, labels), filter-only search without a
+  query, `to` matching a delivered-to address, `offset` paging and
+  `order: asc`, `include_body` truncation, custom folders excluded by default
+  and returned when named.
 - Sync logic against a fake IMAP client interface: folder role mapping
-  including Gmail `\All`, first-sight cursor initialization, incremental
+  including Gmail `\All`, `extra_folders` mapped to custom, Gmail label
+  folders in `extra_folders` rejected, a removed extra folder purged,
+  first-sight cursor initialization, incremental
   advance, UIDVALIDITY reset, CONDSTORE path versus 30-day fallback, VANISHED
   handling, chunked backfill resume after a simulated crash, status rule
   computation, sync request lifecycle.
 - MIME parsing from fixture `.eml` files: GBK-encoded subject, HTML-only
   body, multipart with attachments (metadata extracted, nothing downloaded),
-  oversized body capped.
+  oversized body capped, HTML links rendered as `[text](url)`, delivered-to
+  headers extracted.
 - Draft building: reply headers, `Re:` prefix idempotence, default recipient
-  from Reply-To.
+  from Reply-To. Reply-all recipients with own address and aliases removed.
+  From resolution: explicit alias accepted, unowned address rejected,
+  `*@domain` pattern matched, reply picks the received-at address from To,
+  from Cc, and from delivered-to only, fallback to the account email.
+- Draft editing against the fake IMAP client: omitted fields kept, threading
+  headers carried over, append happens before delete, draft without the
+  marker header refused, missing uid, server without UIDPLUS refused.
+- `SKILL.md` names every operation and input in the zod schemas.
 - Auth middleware with a locally generated JWKS: valid token, expired,
   wrong issuer, disallowed client id, introspection inactive, introspection
   unreachable with and without cache.
@@ -605,11 +772,15 @@ vitest throughout.
 
 A Dovecot container in `test/integration/docker-compose.dovecot.yml`. Append
 fixture messages, run a real worker pass, assert rows and FTS results, append
-a draft through the service and assert it appears in Drafts with `\Draft`.
+a draft through the service and assert it appears in Drafts with `\Draft`,
+then edit it and assert exactly one copy remains with the new content. Sync
+an extra folder and assert it is searchable only when named.
 
 ### 13.3 Manual pre-deploy checklist (README)
 
 - PEEK verified on a real Gmail account: syncing does not mark mail read.
+- A reply drafted to a message received at a personal-domain address on
+  Fastmail shows that address as From in the Fastmail Drafts folder.
 - Outlook device-code login completes and a subsequent sync succeeds.
 - claude.ai connector completes the Authentik handshake and lists tools.
 - A long-lived token works over REST and stops working within 5 minutes of
@@ -631,3 +802,9 @@ the implementation plan fixes package versions.
   introspection endpoint's exact URL and client auth method.
 - Whether 126 and QQ IMAP advertise CONDSTORE. If not, they use the fallback
   path, which is already designed.
+- Which delivery header each provider writes (`Delivered-To`,
+  `X-Delivered-To`, `X-Original-To`), Fastmail in particular, and that
+  imapflow can fetch named header fields alongside the envelope.
+- Which providers advertise UIDPLUS, and imapflow's call for a single-uid
+  expunge. Providers without it cannot use `update_draft`.
+- The `html-to-text` selector options that produce `[text](url)` output.
